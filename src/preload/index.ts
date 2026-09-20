@@ -37,6 +37,8 @@ const validInvokeChannels = [
   'patchAppConfig',
   'getControledMihomoConfig',
   'patchControledMihomoConfig',
+  'setControlDns',
+  'takeDnsOverrideAutoDisabledNotice',
   'resetAppConfig',
   // Profile
   'getProfileConfig',
@@ -75,6 +77,8 @@ const validInvokeChannels = [
   'openFile',
   // Core
   'restartCore',
+  'getSmartModelStatus',
+  'downloadSmartModel',
   'mihomoHotReloadConfig',
   'startMonitor',
   'quitWithoutCore',
@@ -134,6 +138,7 @@ const validInvokeChannels = [
   'closeTrayIcon',
   'updateTrayIcon',
   'updateTrayIconImmediate',
+  'getTrayTrafficStyle',
   // Window
   'showMainWindow',
   'closeMainWindow',
@@ -183,7 +188,8 @@ const validListenChannels = [
   'rulesUpdated',
   'updateDownloadProgress',
   'pluginConfigUpdated',
-  'openPluginFile'
+  'openPluginFile',
+  'dnsOverrideAutoDisabled'
 ] as const
 
 // 允许的 send channels 白名单

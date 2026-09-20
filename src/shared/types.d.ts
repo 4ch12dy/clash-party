@@ -264,6 +264,24 @@ interface ICustomTrayIcons {
   tun?: string
 }
 
+// macOS 状态栏显示网速时托盘图标由渲染进程合成，这些是主进程告诉它该怎么画的参数
+interface ITrayTrafficStyle {
+  // 当前状态对应的托盘图标，data URL
+  icon: string
+  // 图标带状态色时为 true，主进程据此不再把合成图当作 template image
+  colored: boolean
+  // 文字颜色；template image 由系统自动反色，带色时必须自己跟随系统外观
+  textColor: string
+}
+
+type SmartModelVariant = 'standard' | 'middle' | 'large'
+
+interface ISmartModelStatus {
+  state: 'missing' | 'damaged' | 'ready'
+  size: number
+  modified?: number
+}
+
 interface IAppConfig {
   core: 'mihomo' | 'mihomo-alpha' | 'mihomo-smart' | 'mihomo-specific'
   specificVersion?: string
@@ -271,7 +289,6 @@ interface IAppConfig {
   enableSmartOverride: boolean
   smartCoreUseLightGBM: boolean
   smartCoreCollectData: boolean
-  smartCoreStrategy: 'sticky-sessions' | 'round-robin'
   smartCollectorSize?: number
   proxyDisplayMode: 'simple' | 'full'
   proxyDisplayOrder: 'default' | 'delay' | 'name'
@@ -529,6 +546,9 @@ interface IMihomoConfig {
   'geodata-mode'?: boolean
   'geo-auto-update'?: boolean
   'geo-update-interval'?: number
+  'lgbm-auto-update'?: boolean
+  'lgbm-update-interval'?: number
+  'lgbm-url'?: string
   'geox-url'?: {
     geoip?: string
     geosite?: string
@@ -540,6 +560,10 @@ interface IMihomoConfig {
   sniffer: IMihomoSnifferConfig
   profile: IMihomoProfileConfig
 }
+
+// DNS 覆写切换结果；用户确认后原样回传来源指纹。
+type IControlDnsApplyResult =
+  { status: 'applied' } | { status: 'confirm-required'; confirmation: string }
 
 interface IProfileConfig {
   current?: string

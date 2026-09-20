@@ -91,6 +91,8 @@ import {
   setupFirewall
 } from '../sys/misc'
 import { getRuntimeConfig, getRuntimeConfigStr } from '../core/factory'
+import { setControlDns, takeDnsOverrideAutoDisabledNotice } from '../core/dnsOverrideGuard'
+import { getSmartModelStatus, downloadSmartModel } from '../core/smartModel'
 import {
   listWebdavBackups,
   webdavBackup,
@@ -104,6 +106,7 @@ import { getInterfaces } from '../sys/interface'
 import {
   closeTrayIcon,
   copyEnv,
+  getTrayTrafficStyle,
   showTrayIcon,
   updateTrayIcon,
   updateTrayIconImmediate
@@ -271,6 +274,8 @@ const asyncHandlers: Record<string, AsyncFn> = {
   patchAppConfig,
   getControledMihomoConfig,
   patchControledMihomoConfig,
+  setControlDns,
+  takeDnsOverrideAutoDisabledNotice,
   // Profile
   getProfileConfig,
   setProfileConfig,
@@ -305,6 +310,8 @@ const asyncHandlers: Record<string, AsyncFn> = {
   readTextFile,
   // Core
   restartCore,
+  getSmartModelStatus,
+  downloadSmartModel,
   mihomoHotReloadConfig,
   startMonitor,
   quitWithoutCore,
@@ -357,6 +364,7 @@ const asyncHandlers: Record<string, AsyncFn> = {
   showTrayIcon,
   closeTrayIcon,
   updateTrayIcon,
+  getTrayTrafficStyle,
   // Floating Window
   showFloatingWindow,
   closeFloatingWindow,

@@ -7,7 +7,7 @@ import path from 'path'
 import os from 'os'
 import { existsSync, watch, type FSWatcher as NodeFSWatcher } from 'fs'
 import chokidar, { type FSWatcher as ChokidarWatcher } from 'chokidar'
-import { app, ipcMain } from 'electron'
+import { app, dialog, ipcMain } from 'electron'
 import { mainWindow } from '../window'
 import {
   getAppConfig,
@@ -43,9 +43,11 @@ import {
   stopMihomoLogs,
   stopMihomoMemory,
   patchMihomoConfig,
+  mihomoHotReloadConfig,
   getAxios
 } from './mihomoApi'
 import { generateProfile } from './factory'
+import { syncControlDnsAfterApply, type DnsOverrideGuardResult } from './dnsOverrideGuard'
 import { syncSmartModelToTestDir } from './smartModel'
 import {
   checkAdminRestartForTun as checkAdminRestartForTunWithRestart,
@@ -83,11 +85,12 @@ const execFilePromise = promisify(execFile)
 const ctlParam = process.platform === 'win32' ? '-ext-ctl-pipe' : '-ext-ctl-unix'
 const coreHookTimeout = 30000
 const automaticRestartDelay = 750
-// Time we wait for a core process to exit after SIGINT before escalating to
-// SIGKILL. On macOS the utun release path inside the kernel routinely takes
-// 1-2s (the next core spawn would otherwise hit "resource busy"), so 500ms
-// was too tight. 3s covers the observed worst case with plenty of margin.
+// macOS 释放 utun 通常需要 1-2 秒；等待 3 秒后再升级为 SIGKILL，
+// 避免新核心启动时旧核心仍占用虚拟网卡。
 const coreShutdownTimeout = 3000
+const resumeReloadDelay = 5000
+// 同一次失败内核可能连打多行，10 秒内只提示一次，避免弹窗刷屏
+const tunFailureReportInterval = 10000
 const coreProcessNames = ['mihomo', 'mihomo-alpha', 'mihomo-smart'] as const
 
 // 核心进程状态
@@ -104,6 +107,7 @@ let coreOperationTail: Promise<void> = Promise.resolve()
 let pendingRestart: Promise<void> | null = null
 let cancelActiveStartup: ((reason: Error) => void) | null = null
 let automaticRestartController: AbortController | null = null
+let resumeReloadTimer: NodeJS.Timeout | null = null
 
 // 文件监听器
 let coreWatcher: ChokidarWatcher | null = null
@@ -426,6 +430,7 @@ interface CoreConfig {
   detached: boolean
   startupMode: CoreStartupMode
   startupHook?: CoreStartupHook
+  dnsGuard: DnsOverrideGuardResult
 }
 
 function buildCoreEnv(safePath?: string, ageSecretKey?: string): NodeJS.ProcessEnv {
@@ -467,7 +472,7 @@ async function prepareCore(detached: boolean, skipStop = false): Promise<CoreCon
   await manageSmartOverride()
 
   // generateProfile 返回实际使用的 current
-  const current = await generateProfile()
+  const { profileId: current, dnsGuard } = await generateProfile()
   const ageSecretKey = (await getProfileItem(current))?.ageSecretKey || ''
   if (testProfileOnStart) {
     await checkProfile(current, core, diffWorkDir, ageSecretKey)
@@ -512,7 +517,8 @@ async function prepareCore(detached: boolean, skipStop = false): Promise<CoreCon
     ageSecretKey,
     detached,
     startupMode,
-    startupHook
+    startupHook,
+    dnsGuard
   }
 }
 
@@ -589,6 +595,11 @@ function setupCoreListeners(
     if (startupSettled) return
     startupSettled = true
     if (startupTimer) clearTimeout(startupTimer)
+    if (child === proc) {
+      child = null
+      proc.kill('SIGTERM')
+      stopCoreProcessWatchdog(proc.pid)
+    }
     reject(reason)
   }
 
@@ -613,6 +624,11 @@ function setupCoreListeners(
     }
     await patchMihomoConfig({ 'log-level': logLevel })
   }
+
+  proc.once('error', (error) => {
+    managerLogger.error('Core process error', error)
+    rejectStartup(new Error(`Failed to start core process: ${error.message}`))
+  })
 
   proc.on('close', async (code, signal) => {
     managerLogger.info(`Core closed, code: ${code}, signal: ${signal}`)
@@ -648,15 +664,46 @@ function setupCoreListeners(
     }
   })
 
+  let lastTunFailureAt = 0
+
   proc.stdout?.on('data', async (data) => {
     const str = data.toString()
 
     // TUN 权限错误
     if (str.includes('configure tun interface: operation not permitted')) {
+      lastTunFailureAt = Date.now()
       patchControledMihomoConfig({ tun: { enable: false } })
       mainWindow?.webContents.send('controledMihomoConfigUpdated')
       ipcMain.emit('updateTrayMenu')
       rejectStartup(i18next.t('tun.error.tunPermissionDenied'))
+      return
+    }
+
+    // 其它虚拟网卡创建失败：内核只打印 "Start TUN listening error" 并在 ReCreateTun 的 defer 里
+    // 把 tun.enable 置回 false，自身继续运行，界面却仍显示虚拟网卡已开启，
+    // 用户只能看到"开了没效果"。把内核原始错误反馈出来，并同步关掉开关。
+    const tunListenErrorLine = str
+      .split('\n')
+      .find((line: string) => line.includes('Start TUN listening error'))
+    if (tunListenErrorLine && Date.now() - lastTunFailureAt > tunFailureReportInterval) {
+      lastTunFailureAt = Date.now()
+      managerLogger.error('TUN listening error detected:', tunListenErrorLine.trim())
+      try {
+        await patchControledMihomoConfig({ tun: { enable: false } })
+      } catch (error) {
+        managerLogger.warn('Failed to disable TUN after listening error', error)
+      }
+      mainWindow?.webContents.send('controledMihomoConfigUpdated')
+      ipcMain.emit('updateTrayMenu')
+      // 不能用 showErrorBox/showMessageBoxSync：模态框会卡住主进程，内核 stdout 写满后会一起卡死
+      dialog
+        .showMessageBox({
+          type: 'error',
+          title: i18next.t('tun.error.tunStartFailed'),
+          message: i18next.t('tun.error.tunStartFailed'),
+          detail: tunListenErrorLine.trim()
+        })
+        .catch(() => {})
       return
     }
 
@@ -692,27 +739,12 @@ function setupCoreListeners(
       (process.platform === 'win32' && str.includes('RESTful API pipe listening at'))
 
     if (isApiReady) {
-      resolveStartup([
-        new Promise((innerResolve) => {
-          proc.stdout?.on('data', async (innerData) => {
-            if (
-              innerData
-                .toString()
-                .toLowerCase()
-                .includes('start initial compatible provider default')
-            ) {
-              completeCoreStartup()
-                .then(() => innerResolve())
-                .catch((error) => {
-                  managerLogger.warn('Failed to complete core startup', error)
-                  innerResolve()
-                })
-            }
-          })
-        })
-      ])
-
-      await startMihomoApiStreams()
+      try {
+        await startMihomoApiStreams()
+        resolveStartup([completeCoreStartup()])
+      } catch (error) {
+        rejectStartup(error)
+      }
     }
   })
 
@@ -758,6 +790,14 @@ async function startCoreInternal(detached = false, skipStop = false): Promise<Co
 
   const readiness = new Promise<Promise<void>[]>((resolve, reject) => {
     setupCoreListeners(proc, config, hookWaiter, resolve, reject)
+  }).then(async (value) => {
+    // API 就绪后同步本次 DNS 保护结果。
+    try {
+      await syncControlDnsAfterApply(config.dnsGuard)
+    } catch (error) {
+      managerLogger.warn('Failed to sync DNS override state after core start', error)
+    }
+    return value
   })
   const activeCancel = cancelActiveStartup
   readiness.then(
@@ -808,53 +848,47 @@ async function stopCoreInternal(force = false, cancelStartup = true): Promise<vo
     }
   }
 
-  await stopCoreProcessAndStreams(cancelStartup)
+  const stoppedChild = stopCoreProcessAndStreams(cancelStartup)
+
+  try {
+    await ensureCoreProcessExited(stoppedChild)
+  } catch (error) {
+    managerLogger.error(
+      `Core PID ${stoppedChild?.pid ?? 'unknown'} refused to exit within ${coreShutdownTimeout}ms`,
+      error
+    )
+  }
 
   await cleanupStoppedCoreResources()
 }
 
-async function stopCoreProcessAndStreams(cancelStartup = true): Promise<void> {
+function stopCoreProcessAndStreams(
+  cancelStartup = true,
+  keepWatchdog = false
+): ChildProcess | null {
   if (cancelStartup) {
     cancelActiveStartup?.(new Error('Core startup was cancelled by a stop request'))
     cancelActiveStartup = null
   }
-
-  // Detach the current child from the module-level slot BEFORE waiting on it,
-  // so an overlapping start operation can install a fresh handle without
-  // racing with this teardown. We still keep the reference locally so we can
-  // wait for its actual exit (and SIGKILL it if SIGINT is not honored).
-  const dying = child
-  child = null
-  if (dying) {
-    dying.removeAllListeners()
+  const stoppedChild = child
+  if (child) {
+    child.removeAllListeners()
     try {
-      dying.kill('SIGINT')
+      child.kill('SIGINT')
     } catch (error) {
-      managerLogger.warn(`Failed to send SIGINT to core PID ${dying.pid ?? 'unknown'}`, error)
+      managerLogger.warn(`Failed to send SIGINT to core PID ${child.pid ?? 'unknown'}`, error)
     }
-    // ensureCoreProcessExited waits up to coreShutdownTimeout, then escalates
-    // to SIGKILL. This is the ONLY path that guarantees the core is actually
-    // gone before we hand the utun device off to the next spawn. Without it
-    // the new core races the old core's TUN release and silently ends up in
-    // a "resource busy" state: API works, but the old core still owns utun,
-    // so UI proxy switches take effect on the new core while traffic keeps
-    // flowing through the old one.
-    try {
-      await ensureCoreProcessExited(dying)
-    } catch (error) {
-      managerLogger.error(
-        `Core PID ${dying.pid ?? 'unknown'} refused to die within ${coreShutdownTimeout}ms`,
-        error
-      )
-    }
+    child = null
   }
 
-  stopCoreProcessWatchdog()
+  if (!keepWatchdog) stopCoreProcessWatchdog()
 
   stopMihomoTraffic()
   stopMihomoConnections()
   stopMihomoLogs()
   stopMihomoMemory()
+
+  return stoppedChild
 }
 
 async function cleanupStoppedCoreResources(): Promise<void> {
@@ -875,17 +909,19 @@ export async function stopCore(force = false): Promise<void> {
 }
 
 // 退出不排队等待启动/重启完成：先同步终止子进程，再做有界清理。
-// stopCoreProcessAndStreams now waits for the core to actually exit (up to
-// coreShutdownTimeout) and SIGKILLs it if SIGINT is ignored, so the parent
-// window will not exit while leaving an orphan mihomo behind. Callers wrap
-// this in their own upper-bound timeout (see lifecycle.ts).
+// SIGINT 之后必须确认核心真的退出：core.pid 只在轻量模式写入，普通运行时
+// stopPidFileCore 是空操作，没有任何 SIGKILL 兜底。核心若在退出预算内没走完
+// （例如 TUN 拆除慢），主进程 app.exit() 后它就成了孤儿进程。
+// Linux watchdog 也要留到确认退出之后再撤，否则最后一道兜底先于核心消失。
 export async function stopCoreForExit(): Promise<void> {
   coreOperationPhase = 'shutting-down'
   cancelAutomaticRestart()
+  const stoppedChild = stopCoreProcessAndStreams(true, true)
   await Promise.allSettled([
-    stopCoreProcessAndStreams(),
     recoverDNS({ force: true, timeout: 750 }),
-    cleanupStoppedCoreResources()
+    cleanupStoppedCoreResources(),
+    // 确认退出后才撤 watchdog；确认失败时留着它，让它在主进程退出时补 kill -9。
+    ensureCoreProcessExited(stoppedChild).then(() => stopCoreProcessWatchdog(stoppedChild?.pid))
   ])
 }
 
@@ -912,9 +948,7 @@ async function ensureCoreProcessExited(proc: ChildProcess | null): Promise<void>
 
 async function restartCoreOnce(forceStop: boolean): Promise<void> {
   const startAttempt = await runCoreOperation(async () => {
-    const previousChild = child
     await stopCoreInternal(forceStop)
-    if (process.platform === 'darwin') await ensureCoreProcessExited(previousChild)
     return startCoreInternal(false, true)
   })
   await startAttempt.readiness
@@ -956,6 +990,39 @@ async function restartCoreAfterUnexpectedExit(): Promise<void> {
 export function restartCore(forceStop = false): Promise<void> {
   ensureCoreOperationAllowed()
   return trackCoreRestart(() => restartCoreOnce(forceStop))
+}
+
+// 系统挂起会带走 TUN 网卡上的路由和 DNS 劫持规则：唤醒后内核进程还在、HTTP 代理端口
+// 也还在，但 TUN 的 DNS 劫持已经不响应（#1231 报告者用 dig 复现过），于是浏览器拿到真实
+// 解析结果，表现为「挂久了就没网」（#159）。用户的手动解法是去 DNS 设置里存一次，
+// 那条路径走的就是 mihomoHotReloadConfig ——内核侧 executor.ApplyConfig 会重跑
+// updateDNS / updateTun / updateIPTables 并 resolver.ResetConnection()，规则随之重建。
+// 这里在 resume 后自动做同一件事，省去用户手动开关。
+async function reloadCoreAfterResume(): Promise<void> {
+  if (!hasCoreProcess()) return
+  const { tun } = await getControledMihomoConfig()
+  if (!tun?.enable) return
+
+  await mihomoHotReloadConfig()
+  managerLogger.info('Reloaded core config after system resume')
+}
+
+export function handleSystemResume(): void {
+  if (resumeReloadTimer) clearTimeout(resumeReloadTimer)
+  // 唤醒瞬间物理网卡通常还没重新连上，auto-detect-interface 会认到错误的出口，
+  // 等一小会儿再重载。
+  resumeReloadTimer = setTimeout(() => {
+    resumeReloadTimer = null
+    reloadCoreAfterResume().catch((error) => {
+      managerLogger.warn('Failed to reload core config after system resume', error)
+    })
+  }, resumeReloadDelay)
+}
+
+export function cancelSystemResumeReload(): void {
+  if (!resumeReloadTimer) return
+  clearTimeout(resumeReloadTimer)
+  resumeReloadTimer = null
 }
 
 // 保持核心运行
@@ -1038,7 +1105,15 @@ export async function checkProfileConfig(
 
       if (errorLines.length === 0) {
         const allLines = stdout.split('\n').filter((line) => line.trim().length > 0)
-        throw new Error(`${i18next.t('mihomo.error.profileCheckFailed')}:\n${allLines.join('\n')}`)
+        // 内核根本没能启动时（动态链接失败、缺符号、架构不匹配）只有 stderr 有内容，
+        // stdout 为空，此前拼出来的是一句没有任何原因的“配置检查失败”。
+        const detailLines =
+          allLines.length > 0
+            ? allLines
+            : (stderr ?? '').split('\n').filter((line) => line.trim().length > 0)
+        throw new Error(
+          `${i18next.t('mihomo.error.profileCheckFailed')}:\n${detailLines.join('\n')}`
+        )
       } else {
         throw new Error(
           `${i18next.t('mihomo.error.profileCheckFailed')}:\n${errorLines.join('\n')}`

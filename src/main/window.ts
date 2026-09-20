@@ -312,7 +312,8 @@ function setupWindowEvents(window: BrowserWindow): void {
       useDockIcon = true
     } = await getAppConfig()
 
-    if (!useDockIcon) {
+    // 读配置是异步的，这期间窗口可能已被再次显示（快速点击托盘），此时不能再隐藏 Dock 图标
+    if (!useDockIcon && !window.isDestroyed() && !window.isVisible()) {
       hideDockIcon()
     }
 
@@ -399,11 +400,14 @@ export function showMainWindow(): void {
     return
   }
 
-  void createWindow().then(() => {
-    clearQuitTimeout()
-    mainWindow?.show()
-    mainWindow?.focusOnWebView()
-  })
+  // createWindow 重试耗尽后会 throw，缺 catch 会变成主进程未捕获异常弹窗。
+  void createWindow()
+    .then(() => {
+      clearQuitTimeout()
+      mainWindow?.show()
+      mainWindow?.focusOnWebView()
+    })
+    .catch((error) => mainWindowLogger.error('Failed to show main window', error))
 }
 
 export function closeMainWindow(): void {

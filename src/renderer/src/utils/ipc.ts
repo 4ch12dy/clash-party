@@ -62,6 +62,8 @@ interface IpcApi {
   // Config
   getAppConfig: (force?: boolean) => Promise<IAppConfig>
   patchAppConfig: (patch: Partial<IAppConfig>) => Promise<void>
+  setControlDns: (enabled: boolean, confirmation?: string) => Promise<IControlDnsApplyResult>
+  takeDnsOverrideAutoDisabledNotice: () => Promise<boolean>
   getControledMihomoConfig: (force?: boolean) => Promise<Partial<IMihomoConfig>>
   patchControledMihomoConfig: (patch: Partial<IMihomoConfig>) => Promise<void>
   resetAppConfig: () => Promise<void>
@@ -101,6 +103,8 @@ interface IpcApi {
   openFile: (type: 'profile' | 'override', id: string, ext?: 'yaml' | 'js') => Promise<void>
   // Core
   restartCore: () => Promise<void>
+  getSmartModelStatus: () => Promise<ISmartModelStatus>
+  downloadSmartModel: (variant: SmartModelVariant) => Promise<ISmartModelStatus>
   mihomoHotReloadConfig: () => Promise<void>
   startMonitor: () => Promise<void>
   quitWithoutCore: () => Promise<void>
@@ -162,6 +166,7 @@ interface IpcApi {
   showTrayIcon: () => Promise<void>
   closeTrayIcon: () => Promise<void>
   updateTrayIcon: () => Promise<void>
+  getTrayTrafficStyle: () => Promise<ITrayTrafficStyle>
   // Window
   showMainWindow: () => Promise<void>
   closeMainWindow: () => Promise<void>
@@ -238,6 +243,8 @@ export const {
   // Config
   getAppConfig,
   patchAppConfig,
+  setControlDns,
+  takeDnsOverrideAutoDisabledNotice,
   getControledMihomoConfig,
   patchControledMihomoConfig,
   resetAppConfig,
@@ -277,6 +284,8 @@ export const {
   openFile,
   // Core
   restartCore,
+  getSmartModelStatus,
+  downloadSmartModel,
   mihomoHotReloadConfig,
   startMonitor,
   quitWithoutCore,
@@ -332,6 +341,7 @@ export const {
   showTrayIcon,
   closeTrayIcon,
   updateTrayIcon,
+  getTrayTrafficStyle,
   // Window
   showMainWindow,
   closeMainWindow,
